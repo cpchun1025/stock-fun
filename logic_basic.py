@@ -1,42 +1,8 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
-# ===== 基礎工具 =====
-
-def _infer_tick_size_from_prices(prices, max_unique=5000):
-    s = pd.Series(prices).dropna().astype(float)
-    if s.empty or s.nunique() < 2:
-        return np.nan
-    vals = np.sort(s.unique())
-    if len(vals) > max_unique:
-        vals = np.sort(np.random.choice(vals, size=max_unique, replace=False))
-    diffs = np.diff(vals)
-    diffs = diffs[diffs > 0]
-    if len(diffs) == 0:
-        return np.nan
-    tick = np.quantile(diffs, 0.1)  # 取小分位以對抗雜質
-    # 合理小數位
-    if tick < 1e-6: return round(tick, 6)
-    if tick < 1e-4: return round(tick, 5)
-    if tick < 1e-3: return round(tick, 4)
-    return round(tick, 3)
-
-def _rolling_percentile(x, window, min_periods=None):
-    if min_periods is None:
-        min_periods = max(10, window // 5)
-    s = pd.Series(x, dtype=float)
-    out = s.rolling(window=window, min_periods=min_periods)\
-           .apply(lambda v: (v.rank(pct=True).iloc[-1]) if len(v)>0 else np.nan, raw=False)
-    return out.values
-
-def _zscore(x, window, min_periods=None):
-    if min_periods is None:
-        min_periods = max(10, window // 5)
-    s = pd.Series(x, dtype=float)
-    mu = s.rolling(window, min_periods=min_periods).mean()
-    sd = s.rolling(window, min_periods=min_periods).std(ddof=0)
-    z = (s - mu) / (sd.replace(0, np.nan))
-    return z.values
+# ================= Utilities =================
 
 def _ensure_tz_series(series, tz="Asia/Shanghai"):
     s = pd.to_datetime(series)
@@ -46,294 +12,409 @@ def _ensure_tz_series(series, tz="Asia/Shanghai"):
         s = s.dt.tz_convert(tz)
     return s
 
-# ===== A股時段分組 =====
+def _infer_tick_size_from_prices(prices, max_unique=6000):
+    s = pd.Series(prices, dtype=float).dropna()
+    if s.nunique() < 2: return np.nan
+    vals = np.sort(s.unique())
+    if len(vals) > max_unique:
+        vals = np.sort(np.random.choice(vals, size=max_unique, replace=False))
+    diffs = np.diff(vals)
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0: return np.nan
+    tick = np.quantile(diffs, 0.1)
+    return float(pd.Series([tick]).round(6).iloc[0])
+
+def _zscore(x, window, min_periods=None):
+    if min_periods is None:
+        min_periods = max(30, window // 6)
+    s = pd.Series(x, dtype=float)
+    mu = s.rolling(window, min_periods=min_periods).mean()
+    sd = s.rolling(window, min_periods=min_periods).std(ddof=0)
+    z = (s - mu) / (sd.replace(0, np.nan))
+    return z.values
 
 def _label_bucket_cn_a(ts):
-    # ts 為帶時區的 Timestamp（Asia/Shanghai）
-    t = ts.timetz()  # 包含時區資訊的 time
-    t0930 = pd.to_datetime("09:30").tz_localize("Asia/Shanghai").timetz()
-    t0935 = pd.to_datetime("09:35").tz_localize("Asia/Shanghai").timetz()
-    t1125 = pd.to_datetime("11:25").tz_localize("Asia/Shanghai").timetz()
-    t1130 = pd.to_datetime("11:30").tz_localize("Asia/Shanghai").timetz()
-    t1300 = pd.to_datetime("13:00").tz_localize("Asia/Shanghai").timetz()
-    t1305 = pd.to_datetime("13:05").tz_localize("Asia/Shanghai").timetz()
-    t1445 = pd.to_datetime("14:45").tz_localize("Asia/Shanghai").timetz()
-    t1457 = pd.to_datetime("14:57").tz_localize("Asia/Shanghai").timetz()
-    t1500 = pd.to_datetime("15:00").tz_localize("Asia/Shanghai").timetz()
-    t0915 = pd.to_datetime("09:15").tz_localize("Asia/Shanghai").timetz()
-
-    # 禁做：集合競價 09:15–09:30
-    if t >= t0915 and t < t0930:
-        return "auction_open"
-    # 開盤5分鐘
-    if t >= t0930 and t < t0935:
-        return "open"
-    # 上午常態
-    if t >= t0935 and t < t1125:
-        return "morning"
-    # 午前尾段（更嚴）
-    if t >= t1125 and t < t1130:
-        return "pre_lunch_end"
-    # 午休
-    if t >= t1130 and t < t1300:
-        return "lunch_break"
-    # 午後mini-open
-    if t >= t1300 and t < t1305:
-        return "mini_open"
-    # 午後常態
-    if t >= t1305 and t < t1445:
-        return "afternoon"
-    # 尾盤15分鐘
-    if t >= t1445 and t < t1457:
-        return "last15"
-    # 收盤集合競價（禁做）
-    if t >= t1457 and t <= t1500:
-        return "close_auction"
-    # 其他（盤外/異常）
+    t = ts.timetz()
+    tz = "Asia/Shanghai"
+    def tt(s): return pd.to_datetime(s).tz_localize(tz).timetz()
+    cuts = { "0915": tt("09:15"), "0930": tt("09:30"), "0935": tt("09:35"),
+             "1125": tt("11:25"), "1130": tt("11:30"), "1300": tt("13:00"),
+             "1305": tt("13:05"), "1445": tt("14:45"), "1457": tt("14:57"),
+             "1500": tt("15:00") }
+    if t >= cuts["0915"] and t < cuts["0930"]: return "auction_open"
+    if t >= cuts["0930"] and t < cuts["0935"]: return "open"
+    if t >= cuts["0935"] and t < cuts["1125"]: return "morning"
+    if t >= cuts["1125"] and t < cuts["1130"]: return "pre_lunch_end"
+    if t >= cuts["1130"] and t < cuts["1300"]: return "lunch_break"
+    if t >= cuts["1300"] and t < cuts["1305"]: return "mini_open"
+    if t >= cuts["1305"] and t < cuts["1445"]: return "afternoon"
+    if t >= cuts["1445"] and t < cuts["1457"]: return "last15"
+    if t >= cuts["1457"] and t <= cuts["1500"]: return "close_auction"
     return "off"
 
-# 每個分組的門檻微調（你可依標的流動性調整）
 BUCKET_CONF = {
-    "auction_open": {"ban": True},
-    "lunch_break":  {"ban": True},
-    "close_auction":{"ban": True},
-    "off":          {"ban": True},
-
-    "open":        {"S_mul": 1.15, "alpha_add": 0.0003, "cost_mul": 1.3, "T_wait": 3},
-    "mini_open":   {"S_mul": 1.08, "alpha_add": 0.0002, "cost_mul": 1.2, "T_wait": 3},
-    "morning":     {"S_mul": 1.00, "alpha_add": 0.0000, "cost_mul": 1.0, "T_wait": 5},
-    "pre_lunch_end":{"S_mul": 1.20, "alpha_add": 0.0003, "cost_mul": 0.8, "T_wait": 3},
-    "afternoon":   {"S_mul": 1.00, "alpha_add": 0.0000, "cost_mul": 1.0, "T_wait": 5},
-    "last15":      {"S_mul": 1.10, "alpha_add": 0.0002, "cost_mul": 0.9, "T_wait": 3},
+    "auction_open": {"ban": True}, "lunch_break": {"ban": True},
+    "close_auction": {"ban": True}, "off": {"ban": True},
+    "open": {"S_mul": 1.10, "alpha_add": 0.0002, "T_wait": 3},
+    "mini_open": {"S_mul": 1.05, "alpha_add": 0.0002, "T_wait": 3},
+    "morning": {"S_mul": 1.00, "alpha_add": 0.0, "T_wait": 5},
+    "pre_lunch_end": {"S_mul": 1.15, "alpha_add": 0.0002, "T_wait": 3},
+    "afternoon": {"S_mul": 1.00, "alpha_add": 0.0, "T_wait": 5},
+    "last15": {"S_mul": 1.10, "alpha_add": 0.0002, "T_wait": 3},
 }
 
-# ===== 主函式：含分組版 =====
+# ================= Signal generator (vol-dominant) =================
 
-def generate_front_run_signals_ashare(intraday_tick: pd.DataFrame,
-                                      intraday_trade: pd.DataFrame = None,
-                                      params: dict = None) -> pd.DataFrame:
+def generate_signals_vol_dominant(l1_df: pd.DataFrame, trade_df: pd.DataFrame, params: dict=None):
     """
-    A股分組版：低價股友善的「先手預判→輕確認→加倉/退出」。
-    會根據盤中分組自動調整 S 門檻、突破 alpha、成本上限 cost_gate、T_wait。
+    Inputs:
+      - l1_df: columns [time, bidPrice, bidSize, askPrice, askSize]
+      - trade_df: columns [time, price, vol]
+    Output:
+      DataFrame with precursor features, vol-dominant cost gate, and signals.
     """
-
-    # 參數（可外部覆蓋）
     P = {
-        'W_box': 60, 'W_touch': 10, 'W_fast': 3,
-        'W_rv': 30, 'W_norm': 1200, 'W_z': 180,
-        'alpha_base': 0.0007,
-        'max_rel_spread': 0.0012,
-        'S_threshold': 0.70,
-        'T_wait': 5,
-        'confirm_ofi_z': 0.2,
-        'confirm_vol_z': 0.6,
-        'fail_retrace_ticks': 0.5,
-        'w_dq': 0.30, 'w_askthin': 0.20, 'w_bidstep': 0.15,
-        'w_touch': 0.15, 'w_pullback': 0.10, 'w_spread': 0.10, 'w_resil': 0.10,
-        'tz': "Asia/Shanghai",
+        "tz": "Asia/Shanghai",
+        "W_box": 60, "W_touch": 10, "W_fast": 3,
+        "W_rv": 30, "W_norm": 1800, "W_z": 180,
+        "alpha_base": 0.0006,
+        "S_threshold": 0.68,
+        # vol-dominant cost-gate via rolling quantiles of rel_spread
+        "p_low": 0.60, "p_high": 0.97,
+        "gate_floor_mult": 0.80, "gate_cap_mult": 1.05,
     }
-    if params:
-        P.update(params)
+    if params: P.update(params)
 
-    # ---------- 數據準備 ----------
-    q = intraday_tick.copy()
-    # 標準欄位
-    rename_map = {}
-    for c in q.columns:
-        lc = c.lower()
-        if lc == 'time': rename_map[c] = 'time'
-        elif lc == 'bidprice': rename_map[c] = 'bidPrice'
-        elif lc == 'bidsize': rename_map[c] = 'bidSize'
-        elif lc == 'askprice': rename_map[c] = 'askPrice'
-        elif lc == 'asksize': rename_map[c] = 'askSize'
-    q = q.rename(columns=rename_map)
+    q = l1_df.copy()
+    q = q.rename(columns={
+        'time':'time',
+        'bidprice':'bidPrice','bidPrice':'bidPrice',
+        'bidsize':'bidSize','bidSize':'bidSize',
+        'askprice':'askPrice','askPrice':'askPrice',
+        'asksize':'askSize','askSize':'askSize'
+    })
+    need = ["time","bidPrice","bidSize","askPrice","askSize"]
+    miss = [c for c in need if c not in q.columns]
+    if miss: raise ValueError(f"L1 missing: {miss}")
 
-    need_cols = {'time','bidPrice','bidSize','askPrice','askSize'}
-    miss = need_cols - set(q.columns)
-    if miss:
-        raise ValueError(f"intraday_tick 缺少欄位: {miss}")
+    q["time"] = _ensure_tz_series(q["time"], P["tz"])
+    q = q.sort_values("time").reset_index(drop=True)
+    q["date"] = q["time"].dt.tz_convert(P["tz"]).dt.date
 
-    # 時區統一
-    q['time'] = _ensure_tz_series(q['time'], tz=P['tz'])
-    q = q.sort_values('time').reset_index(drop=True)
+    # Basic
+    for c in ["bidPrice","askPrice","bidSize","askSize"]:
+        q[c] = q[c].astype(float)
+    q["mid"] = (q["bidPrice"] + q["askPrice"]) / 2.0
+    q["spread"] = (q["askPrice"] - q["bidPrice"])
+    q["rel_spread"] = q["spread"] / q["mid"].replace(0, np.nan)
 
-    # 基本量價
-    q['mid'] = (q['bidPrice'].astype(float) + q['askPrice'].astype(float)) / 2.0
-    q['spread'] = (q['askPrice'] - q['bidPrice']).astype(float)
-    q['rel_spread'] = q['spread'] / q['mid'].replace(0, np.nan)
+    # Tick per day
+    ticks=[]
+    for d,g in q.groupby("date", sort=False):
+        tick = _infer_tick_size_from_prices(pd.concat([g["bidPrice"], g["askPrice"]]).values)
+        ticks.append(pd.Series(tick, index=g.index))
+    q["tick_size"] = pd.concat(ticks).sort_index()
+    q["tick_rel"] = q["tick_size"] / q["mid"].replace(0, np.nan)
 
-    # 推斷 tick_size / tick_rel
-    tick_guess = _infer_tick_size_from_prices(pd.concat([q['bidPrice'], q['askPrice'], q['mid']], axis=0).values)
-    q['tick_size'] = tick_guess
-    q['tick_rel'] = q['tick_size'] / q['mid'].replace(0, np.nan)
+    # Trade resample → value per second (vps)
+    t = trade_df.copy()
+    t = t.rename(columns={'time':'time','price':'price','vol':'vol'})
+    if not {'time','price','vol'}.issubset(t.columns):
+        raise ValueError("trade_df must have [time, price, vol]")
+    t["time"] = _ensure_tz_series(t["time"], P["tz"])
+    t = t.sort_values("time")
+    t["value"] = t["price"].astype(float) * t["vol"].astype(float)
+    # 1-second resample, 5-second smoother
+    vps = (t.set_index("time")["value"]
+             .resample("1s").sum().rolling(5, min_periods=1).sum()
+             .rename("vps").reset_index())
+    # as-of merge
+    q = pd.merge_asof(q.sort_values("time"), vps.sort_values("time"),
+                      on="time", direction="backward", tolerance=pd.Timedelta("1s"))
+    q["vps"] = q["vps"].fillna(0.0)
+    q["vps_z"] = _zscore(q["vps"].values, P["W_z"])
 
-    # L1 隊列不平衡/變化
-    q['q_imb'] = (q['bidSize'] - q['askSize']) / (q['bidSize'] + q['askSize']).replace(0, np.nan)
-    q['dq'] = q['q_imb'] - q['q_imb'].shift(1)
+    # Queue/tempo features
+    q["q_imb"] = (q["bidSize"] - q["askSize"]) / (q["bidSize"] + q["askSize"]).replace(0, np.nan)
+    q["dq"] = q["q_imb"] - q["q_imb"].shift(1)
+    d_asize = q["askSize"].diff()
+    q["ask_thin_freq"] = (d_asize < 0).astype(int).rolling(P["W_fast"], min_periods=1).mean()
+    q["bid_step"] = (q["bidPrice"] > q["bidPrice"].shift(1)).astype(int)\
+                    .rolling(P["W_fast"], min_periods=1).sum()
 
-    # ask 薄化頻率（W_fast 內下降比例）
-    d_asize = q['askSize'].diff()
-    ask_down = (d_asize < 0).astype(int)
-    q['ask_thin_freq'] = ask_down.rolling(P['W_fast'], min_periods=1).mean()
+    # Box/touch
+    roll_max = q["mid"].rolling(P["W_box"], min_periods=1).max()
+    roll_min = q["mid"].rolling(P["W_box"], min_periods=1).min()
+    q["range_width"] = (roll_max - roll_min) / q["mid"].replace(0, np.nan)
 
-    # bid 上跳步頻（W_fast 內 bidPrice 上移次數）
-    bid_step_raw = (q['bidPrice'] > q['bidPrice'].shift(1)).astype(int)
-    q['bid_step'] = bid_step_raw.rolling(P['W_fast'], min_periods=1).sum()
+    tol = 0.5 * (q["tick_size"] / q["mid"])
+    q["touch_upper"] = ((roll_max - q["mid"]) / q["mid"] <= tol).astype(int)
+    q["touch_density"] = q["touch_upper"].rolling(P["W_touch"], min_periods=1).mean()
+    recent_min = q["mid"].rolling(P["W_touch"], min_periods=1).min()
+    q["pullback_depth"] = (roll_max - recent_min) / q["mid"].replace(0, np.nan)
 
-    # 箱體/觸碰/回撤
-    roll_max = q['mid'].rolling(P['W_box'], min_periods=1).max()
-    roll_min = q['mid'].rolling(P['W_box'], min_periods=1).min()
-    q['range_width'] = (roll_max - roll_min) / q['mid'].replace(0, np.nan)
+    # Compression regime
+    ret = q["mid"].pct_change()
+    q["rv_short"] = ret.rolling(P["W_rv"], min_periods=5).std()
+    def _roll_pct(arr, win, mp):
+        s = pd.Series(arr)
+        return s.rolling(win, min_periods=mp).apply(
+            lambda v: (pd.Series(v).rank(pct=True).iloc[-1]), raw=False)
+    q["range_pct"] = _roll_pct(q["range_width"].values, P["W_norm"], 120).values
+    q["rv_pct"] = _roll_pct(q["rv_short"].values, P["W_norm"], 120).values
+    q["compression"] = ((q["range_pct"] <= 0.25) & (q["rv_pct"] >= 0.35)).astype(int)
 
-    tol = 0.5 * q['tick_rel']
-    q['touch_upper'] = ((roll_max - q['mid'])/q['mid'] <= tol).astype(int)
-    q['touch_density'] = q['touch_upper'].rolling(P['W_touch'], min_periods=1).mean()
+    # Z-features
+    q["z_dq"] = _zscore(q["dq"].values, P["W_z"])
+    q["z_askthin"] = _zscore(q["ask_thin_freq"].values, P["W_z"])
+    q["z_bidstep"] = _zscore(q["bid_step"].values, P["W_z"])
+    q["z_touch"] = _zscore(q["touch_density"].values, P["W_z"])
+    q["z_pullback"] = _zscore(q["pullback_depth"].values, P["W_z"])
+    q["z_spread"] = _zscore(q["rel_spread"].values, P["W_z"])
+    # Resiliency: slow refill after thinning = higher
+    q["z_resil"] = _zscore((-d_asize.fillna(0)).values, P["W_z"])
 
-    recent_min = q['mid'].rolling(P['W_touch'], min_periods=1).min()
-    q['pullback_depth'] = (roll_max - recent_min) / q['mid'].replace(0, np.nan)
-
-    # 壓縮準備：range vs rv 的分位
-    ret = q['mid'].pct_change()
-    q['rv_short'] = ret.rolling(P['W_rv'], min_periods=5).std()
-    q['range_pct'] = _rolling_percentile(q['range_width'].values, P['W_norm'])
-    q['rv_pct'] = _rolling_percentile(q['rv_short'].values, P['W_norm'])
-    q['compression'] = ((q['range_pct'] <= 0.2) & (q['rv_pct'] >= 0.4)).astype(int)
-
-    # z 分供評分
-    q['z_dq'] = _zscore(q['dq'].values, P['W_z'])
-    q['z_askthin'] = _zscore(q['ask_thin_freq'].values, P['W_z'])
-    q['z_bidstep'] = _zscore(q['bid_step'].values, P['W_z'])
-    q['z_touch'] = _zscore(q['touch_density'].values, P['W_z'])
-    q['z_pullback'] = _zscore(q['pullback_depth'].values, P['W_z'])
-    q['z_spread'] = _zscore(q['rel_spread'].values, P['W_z'])
-    q['z_resil'] = _zscore((-d_asize.fillna(0)).values, P['W_z'])  # 回補慢=好
-
-    # 前導評分 S
-    q['S'] = (
-        P['w_dq'] * q['z_dq'].fillna(0) +
-        P['w_askthin'] * q['z_askthin'].fillna(0) +
-        P['w_bidstep'] * q['z_bidstep'].fillna(0) +
-        P['w_touch'] * q['z_touch'].fillna(0) +
-        P['w_pullback'] * (-q['z_pullback'].fillna(0)) +
-        P['w_spread'] * (-q['z_spread'].fillna(0)) +
-        P['w_resil'] * q['z_resil'].fillna(0)
+    # Composite S
+    q["S"] = (
+        0.30*q["z_dq"].fillna(0) +
+        0.20*q["z_askthin"].fillna(0) +
+        0.15*q["z_bidstep"].fillna(0) +
+        0.15*q["z_touch"].fillna(0) +
+        0.10*(-q["z_pullback"].fillna(0)) +
+        0.05*(-q["z_spread"].fillna(0)) +
+        0.05*q["z_resil"].fillna(0)
     )
 
-    # 自適應突破與成本
-    q['alpha_adp_base'] = np.maximum(P['alpha_base'], 0.5 * q['tick_rel'])
-    q['cost_gate_base'] = np.minimum(P['max_rel_spread'], 0.8 * q['tick_rel'])
+    # Vol-dominant cost gate via rolling rel_spread quantile p(vps_z)
+    zc = np.clip(q["vps_z"].values, -2, 3)
+    p = P["p_low"] + (P["p_high"] - P["p_low"]) * (1.0 / (1.0 + np.exp(-zc)))
+    p = np.clip(p, P["p_low"], P["p_high"])
 
-    # 盤中分組
-    q['bucket'] = q['time'].apply(_label_bucket_cn_a)
+    rel = pd.Series(q["rel_spread"].values)
+    win = P["W_norm"]
+    q50 = rel.rolling(win, min_periods=120).quantile(0.50).values
+    q80 = rel.rolling(win, min_periods=120).quantile(0.80).values
+    q95 = rel.rolling(win, min_periods=120).quantile(0.95).values
+    gate_low = q50 * (1 - np.clip((p-0.60)/0.20, 0, 1)) + q80 * np.clip((p-0.60)/0.20, 0, 1)
+    gate_high = q80 * (1 - np.clip((p-0.80)/0.15, 0, 1)) + q95 * np.clip((p-0.80)/0.15, 0, 1)
+    cost_gate = np.where(p < 0.80, gate_low, gate_high)
+    med = rel.rolling(win, min_periods=120).median().values
+    mx = rel.rolling(win, min_periods=120).max().values
+    cost_gate = np.maximum(cost_gate, P["gate_floor_mult"]*med)
+    cost_gate = np.minimum(cost_gate, P["gate_cap_mult"]*mx)
+    q["cost_gate"] = cost_gate
 
-    # 將分組微調應用到每筆
-    ban_mask = np.zeros(len(q), dtype=bool)
-    S_adj = np.full(len(q), P['S_threshold'], dtype=float)
-    alpha_adj = q['alpha_adp_base'].values.copy()
-    cost_adj = q['cost_gate_base'].values.copy()
-    T_wait_arr = np.full(len(q), P['T_wait'], dtype=int)
+    # Adaptive micro-break
+    q["alpha_adp"] = np.maximum(P["alpha_base"], 0.5 * q["tick_rel"])
 
-    conf_map = BUCKET_CONF
-    for i, b in enumerate(q['bucket'].values):
-        conf = conf_map.get(b, {})
-        if conf.get("ban", False):
-            ban_mask[i] = True
-        S_adj[i] = P['S_threshold'] * conf.get("S_mul", 1.0)
-        alpha_adj[i] = alpha_adj[i] + conf.get("alpha_add", 0.0)
-        cost_adj[i] = cost_adj[i] * conf.get("cost_mul", 1.0)
-        if "T_wait" in conf:
-            T_wait_arr[i] = int(conf["T_wait"])
+    # Buckets and per-bucket tuning
+    q["bucket"] = q["time"].apply(_label_bucket_cn_a)
+    S_thr = np.full(len(q), P["S_threshold"], dtype=float)
+    T_wait = np.full(len(q), 5, dtype=int)
+    alpha_add = np.zeros(len(q))
+    ban = np.zeros(len(q), dtype=bool)
+    for i,b in enumerate(q["bucket"].values):
+        conf = BUCKET_CONF.get(b, {})
+        if conf.get("ban", False): ban[i] = True
+        S_thr[i] = P["S_threshold"] * conf.get("S_mul", 1.0)
+        alpha_add[i] = conf.get("alpha_add", 0.0)
+        T_wait[i] = conf.get("T_wait", 5)
+    q["S_threshold_adj"] = S_thr
+    q["alpha_adp"] = q["alpha_adp"] + alpha_add
+    q["T_wait_sec"] = T_wait
+    q["ban"] = ban
 
-    q['S_threshold_adj'] = S_adj
-    q['alpha_adp'] = alpha_adj
-    q['cost_gate'] = cost_adj
-    q['ban'] = ban_mask
-    q['T_wait_sec'] = T_wait_arr
+    # Gates
+    prebreak_ok = (q["mid"] >= (roll_max * (1 + q["alpha_adp"]))) | (q["touch_density"] >= 0.2)
+    spread_ok = (q["rel_spread"] <= q["cost_gate"])
+    compression_ok = (q["compression"] == 1)
 
-    # 微突破/允許條件
-    prebreak_ok = (q['mid'] >= (roll_max * (1 + q['alpha_adp']))) | (q['touch_density'] >= 0.2)
-    spread_ok = (q['rel_spread'] <= q['cost_gate'])
-    compression_ok = (q['compression'] == 1)
-
-    # 先手入場（小倉）
-    q['front_run_enter'] = (
-        (q['S'] >= q['S_threshold_adj']) &
-        prebreak_ok & spread_ok & compression_ok &
-        (~q['ban'])
+    q["front_run_enter"] = (
+        (q["S"] >= q["S_threshold_adj"]) &
+        prebreak_ok & spread_ok & compression_ok & (~q["ban"])
     ).astype(int)
 
-    # 交易資料（可選）→ vol_z
-    if intraday_trade is not None and 'time' in intraday_trade.columns:
-        t = intraday_trade.copy()
-        t = t.rename(columns={c: ('time' if c.lower()=='time' else c) for c in t.columns})
-        t['time'] = _ensure_tz_series(t['time'], tz=P['tz'])
-        t = t.sort_values('time')
-        q = pd.merge_asof(q.sort_values('time'),
-                          t[['time','volume','price']].sort_values('time'),
-                          on='time', direction='backward', tolerance=pd.Timedelta('1s'))
-        vol = q['volume'].fillna(0).astype(float)
-        q['vol_z'] = _zscore(vol.values, P['W_z'])
-    else:
-        q['vol_z'] = np.nan
+    # Light confirm using true trades: ofi_z + vol_z
+    # Resample trades to 1s bars
+    trade_sec = (t.set_index("time")[["price","vol"]]
+                   .resample("1s").agg({"price":"last","vol":"sum"})
+                   .fillna({"vol":0}))
+    trade_sec["ret"] = trade_sec["price"].pct_change().fillna(0)
+    trade_sec["val"] = (trade_sec["price"].fillna(method="ffill").fillna(0) * trade_sec["vol"])
+    trade_sec["vol_z"] = _zscore(trade_sec["vol"].values, 180)
+    trade_sec["val_z"] = _zscore(trade_sec["val"].values, 180)
+    # Approx OFI at 1s: price up → +vol, down → -vol
+    trade_sec["ofi"] = np.sign(trade_sec["ret"]) * trade_sec["vol"]
+    trade_sec["ofi_z"] = _zscore(trade_sec["ofi"].values, 180)
+    trade_sec = trade_sec.reset_index()
 
-    # OFI 近似（L1 proxy）
-    ofi_proxy = (q['bidPrice'].diff().fillna(0) > 0).astype(int) - (q['askPrice'].diff().fillna(0) < 0).astype(int)
-    q['ofi_z'] = _zscore(ofi_proxy.values, P['W_z'])
+    # Merge 1s trade stats back to tick rows (as-of)
+    q = pd.merge_asof(q.sort_values("time"), trade_sec[["time","vol_z","val_z","ofi_z"]].sort_values("time"),
+                      on="time", direction="backward", tolerance=pd.Timedelta("1s"))
+    q[["vol_z","val_z","ofi_z"]] = q[["vol_z","val_z","ofi_z"]].fillna(0)
 
-    # 輕確認條件
-    q['light_confirm'] = (
-        (q['ofi_z'] >= P['confirm_ofi_z']) |
-        (q['vol_z'] >= P['confirm_vol_z']) |
-        ((q['touch_density'] >= 0.3) & spread_ok)
+    q["light_confirm"] = (
+        (q["ofi_z"] >= 0.2) |
+        (q["vol_z"] >= 0.7) |
+        ((q["touch_density"] >= 0.3) & spread_ok)
     )
 
-    # ---------- 事件流程：用「秒」為窗口（依分組 T_wait） ----------
-    q['confirm_add'] = 0
-    q['fail_exit'] = 0
-    q['time_exit'] = 0
-    q['pos_suggest'] = 0.0
-    q.loc[q['front_run_enter'] == 1, 'pos_suggest'] = 0.35
+    return q
 
-    # 逐筆處理先手點：以秒為窗口（精確，不受不規則tick影響）
-    # 註：為簡潔採用迴圈，日內量通常可接受；若極高速資料再做向量化優化
-    times = q['time'].values
-    mids = q['mid'].values
-    tick_rel = q['tick_rel'].values
-    light = q['light_confirm'].values.astype(bool)
+# ================= Backtest (60s hold) =================
 
-    enter_idx = np.flatnonzero(q['front_run_enter'].values == 1)
-    for idx in enter_idx:
-        t0 = times[idx]
-        wait_s = int(q['T_wait_sec'].iloc[idx])
-        t1 = t0 + pd.Timedelta(seconds=wait_s)
-        # 見未來窗口索引
-        mask = (times > t0) & (times <= t1)
-        if not mask.any():
-            q.at[idx, 'time_exit'] = 1
-            q.at[idx, 'pos_suggest'] = 0.0
-            continue
-        # 輕確認
-        if light[mask].any():
-            q.at[idx, 'confirm_add'] = 1
-            q.at[idx, 'pos_suggest'] = 1.0
-            continue
-        # 回撤判斷（相對 0.5 tick）
-        min_mid = np.nanmin(mids[mask])
-        retrace_thr_abs = P['fail_retrace_ticks'] * tick_rel[idx] * mids[idx]
-        if (mids[idx] - min_mid) >= retrace_thr_abs:
-            q.at[idx, 'fail_exit'] = 1
-            q.at[idx, 'pos_suggest'] = 0.0
-        else:
-            q.at[idx, 'time_exit'] = 1
-            q.at[idx, 'pos_suggest'] = 0.0
+def backtest_hold60(signals: pd.DataFrame, mode="enter_then_scale_if_confirm", hold_sec=60, fill="ba"):
+    df = signals.copy().reset_index(drop=True)
+    need = ["time","front_run_enter","light_confirm","T_wait_sec",
+            "bidPrice","askPrice","mid"]
+    for c in need:
+        if c not in df.columns: raise ValueError(f"signals missing {c}")
 
-    # ---------- 輸出 ----------
-    out_cols = [
-        'time','bucket','mid','bidPrice','askPrice','bidSize','askSize',
-        'spread','rel_spread','tick_size','tick_rel',
-        'q_imb','dq','ask_thin_freq','bid_step','touch_density','pullback_depth',
-        'range_width','range_pct','rv_short','rv_pct','compression',
-        'S','S_threshold_adj','alpha_adp','cost_gate','vol_z','ofi_z',
-        'front_run_enter','confirm_add','fail_exit','time_exit','pos_suggest','T_wait_sec'
-    ]
-    return q[out_cols].copy()
+    times = pd.to_datetime(df["time"]).values
+    bid = df["bidPrice"].values.astype(float)
+    ask = df["askPrice"].values.astype(float)
+    mid = df["mid"].values.astype(float)
+    enter_flag = df["front_run_enter"].values.astype(int)
+    light = df["light_confirm"].values.astype(bool)
+    Twait = df["T_wait_sec"].values.astype(int)
+
+    def _idx_at_or_after(t):
+        i = np.searchsorted(times, t, side="left")
+        return i if i < len(times) else None
+    def _px(i, side):
+        if i is None: return np.nan
+        return mid[i] if fill=="mid" else (ask[i] if side=="buy" else bid[i])
+
+    trades=[]
+    enter_idx = np.flatnonzero(enter_flag==1)
+    for i0 in enter_idx:
+        t0 = times[i0]
+        t_dead = t0 + pd.Timedelta(seconds=int(Twait[i0]))
+        mask = (times > t0) & (times <= t_dead) & light
+        found = np.flatnonzero(mask)
+        i_confirm = int(found[0]) if len(found) else None
+
+        if mode=="enter_only":
+            ie=i0; ix=_idx_at_or_after(t0+pd.Timedelta(seconds=hold_sec))
+            if ix is None: continue
+            p_in=_px(ie,"buy"); p_out=_px(ix,"sell")
+            if np.isnan(p_in) or np.isnan(p_out): continue
+            trades.append({"entry_time":times[ie],"exit_time":times[ix],
+                           "entry_idx":ie,"exit_idx":ix,"weight":1.0,
+                           "ret":(p_out-p_in)/p_in,
+                           "date": pd.Timestamp(times[ie]).tz_convert("Asia/Shanghai").date()})
+        elif mode=="enter_then_scale_if_confirm":
+            # leg 1
+            ix=_idx_at_or_after(t0+pd.Timedelta(seconds=hold_sec))
+            if ix is not None:
+                p_in=_px(i0,"buy"); p_out=_px(ix,"sell")
+                if not (np.isnan(p_in) or np.isnan(p_out)):
+                    trades.append({"entry_time":times[i0],"exit_time":times[ix],
+                                   "entry_idx":i0,"exit_idx":ix,"weight":0.35,
+                                   "ret":(p_out-p_in)/p_in,
+                                   "date": pd.Timestamp(times[i0]).tz_convert("Asia/Shanghai").date()})
+            # leg 2
+            if i_confirm is not None:
+                t1 = times[i_confirm]
+                ix=_idx_at_or_after(t1+pd.Timedelta(seconds=hold_sec))
+                if ix is not None:
+                    p_in=_px(i_confirm,"buy"); p_out=_px(ix,"sell")
+                    if not (np.isnan(p_in) or np.isnan(p_out)):
+                        trades.append({"entry_time":times[i_confirm],"exit_time":times[ix],
+                                       "entry_idx":i_confirm,"exit_idx":ix,"weight":0.65,
+                                       "ret":(p_out-p_in)/p_in,
+                                       "date": pd.Timestamp(times[i_confirm]).tz_convert("Asia/Shanghai").date()})
+        else: # confirm_only
+            if i_confirm is None: continue
+            ie=i_confirm; ix=_idx_at_or_after(times[ie]+pd.Timedelta(seconds=hold_sec))
+            if ix is None: continue
+            p_in=_px(ie,"buy"); p_out=_px(ix,"sell")
+            if np.isnan(p_in) or np.isnan(p_out): continue
+            trades.append({"entry_time":times[ie],"exit_time":times[ix],
+                           "entry_idx":ie,"exit_idx":ix,"weight":1.0,
+                           "ret":(p_out-p_in)/p_in,
+                           "date": pd.Timestamp(times[ie]).tz_convert("Asia/Shanghai").date()})
+
+    trades = pd.DataFrame(trades)
+    if trades.empty:
+        return trades, pd.DataFrame(), pd.Series({"n_legs":0,"n_trades":0,"win_rate":np.nan,"avg_bp":np.nan})
+    trades["ret_bp"] = trades["ret"]*1e4
+    trades = trades.sort_values(["entry_time","exit_time"]).reset_index(drop=True)
+    trades["trade_id"] = trades["entry_idx"].rank(method="dense").astype(int)
+
+    trade_sum = trades.groupby("trade_id").apply(
+        lambda g: pd.Series({
+            "entry_time": g["entry_time"].min(),
+            "exit_time": g["exit_time"].max(),
+            "date": g["date"].iloc[0],
+            "ret": np.sum(g["ret"]*g["weight"]),
+            "legs": len(g)
+        })
+    ).reset_index(drop=True)
+    trade_sum["ret_bp"] = trade_sum["ret"]*1e4
+
+    summary = pd.Series({
+        "n_legs": len(trades),
+        "n_trades": len(trade_sum),
+        "avg_bp": trade_sum["ret_bp"].mean(),
+        "median_bp": trade_sum["ret_bp"].median(),
+        "std_bp": trade_sum["ret_bp"].std(ddof=0),
+        "win_rate": (trade_sum["ret"]>0).mean()
+    })
+    return trades, trade_sum, summary
+
+# ================= Plotting =================
+
+def plot_results(trade_sum: pd.DataFrame, signals: pd.DataFrame, title="Backtest"):
+    if trade_sum.empty:
+        print("No trades to plot."); return
+    ts = trade_sum.sort_values("exit_time").copy()
+    ts["cum_bp"] = ts["ret_bp"].cumsum()
+
+    fig = plt.figure(figsize=(12,9))
+    gs = fig.add_gridspec(3,2, height_ratios=[1,1,1])
+
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(ts["exit_time"], ts["cum_bp"], color="#2a9d8f")
+    ax1.set_title(f"{title} - Cumulative PnL (bp)")
+    ax1.set_ylabel("bp"); ax1.grid(True, alpha=0.3)
+
+    ax2 = fig.add_subplot(gs[1, 0])
+    daily = ts.groupby("date")["ret_bp"].sum()
+    ax2.bar(daily.index.astype(str), daily.values, color="#457b9d")
+    ax2.set_title("Daily PnL (bp)"); ax2.tick_params(axis='x', rotation=45); ax2.grid(True, axis="y", alpha=0.3)
+
+    ax3 = fig.add_subplot(gs[1, 1])
+    cnt = signals.groupby("bucket")["front_run_enter"].sum().sort_values(ascending=False)
+    ax3.bar(cnt.index, cnt.values, color="#8d99ae")
+    ax3.set_title("Signal count by bucket"); ax3.tick_params(axis='x', rotation=45); ax3.grid(True, axis="y", alpha=0.3)
+
+    rnd = ts.sample(1, random_state=42).iloc[0]
+    t0 = rnd["entry_time"] - pd.Timedelta(seconds=30)
+    t1 = rnd["exit_time"] + pd.Timedelta(seconds=30)
+    seg = signals[(signals["time"]>=t0)&(signals["time"]<=t1)].copy()
+    ax4 = fig.add_subplot(gs[2, :])
+    ax4.plot(seg["time"], seg["mid"], label="mid", color="#264653")
+    ax4.fill_between(seg["time"], seg["bidPrice"], seg["askPrice"], color="#e9c46a", alpha=0.25, label="bid-ask")
+    ax4.scatter([rnd["entry_time"]],[seg.loc[seg["time"]==rnd["entry_time"],"mid"].iloc[0]], color="green", label="entry")
+    ax4.scatter([rnd["exit_time"]],[seg.loc[seg["time"]==rnd["exit_time"],"mid"].iloc[0]], color="red", label="exit")
+    ax4.set_title("Example trade context"); ax4.legend(); ax4.grid(True, alpha=0.3)
+
+    plt.tight_layout(); plt.show()
+
+# ================= Example run =================
+
+if __name__ == "__main__":
+    # Replace the next two lines with your actual data reading.
+    # l1_df = pd.read_csv("l1_multi_day.csv")
+    # trade_df = pd.read_csv("trades_multi_day.csv")
+    
+    sig = generate_signals_vol_dominant(l1_df, trade_df, params=dict(
+    alpha_base=0.0006,
+    S_threshold=0.68,
+    W_norm=1800,   # 30-minute history for quantiles
+    p_high=0.97
+    ))
+    legs, trades, summary = backtest_hold60(sig, mode="enter_then_scale_if_confirm", hold_sec=60, fill="ba")
+    print(summary)
+    plot_results(trades, sig, title="Vol-dominant precursor (with trades), 60s hold")
