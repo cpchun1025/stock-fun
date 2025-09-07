@@ -339,31 +339,47 @@ def generate_signals_vol_dominant_cn(l1_df: pd.DataFrame,
     return q
 
 # ============ 回测（固定持有时长 60s；mid/BA 填价；稳健边界处理） ============
-
 def backtest_hold60_cn(signals: pd.DataFrame,
                        mode="enter_then_scale_if_confirm",
                        hold_sec=60,
                        fill="mid"):
     """
-    稳健 60s 持有回测：
-    - fill: 'mid'（推荐在成本关闭阶段）或 'ba'（买用ask、卖用bid，更保守）
-    - mode:
-        * 'enter_then_scale_if_confirm': 有入场即建第一腿（权重0.35）；若 T_wait 内出现轻确认，则加第二腿（权重0.65）
-        * 'enter_only': 仅第一腿（权重1.0）
-        * 'confirm_only': 仅当出现确认信号时才建仓（权重1.0）
-    - 出场时间找不到时，回退到当日最后一个允许交易的时间点（避开午休/集合竞价）
+    简洁稳健版 60s 回测（已修复 searchsorted 时间类型报错）
+    - 关键修复：把分组后的时间列统一转为 numpy datetime64[ns]，查询时间同样转为此类型再 searchsorted
     """
-    df = signals.copy().reset_index(drop=True)
+    df = signals.copy()
     need = ["time","front_run_enter","light_confirm","T_wait_sec",
             "bidPrice","askPrice","mid","bucket","date"]
     miss = [c for c in need if c not in df.columns]
     if miss:
         raise ValueError(f"signals 缺少列: {miss}")
 
+    # 去掉无效时间
+    df = df[pd.notna(df["time"])].copy()
+
     all_legs = []
+
+    # 小工具：把一列时间统一成 numpy datetime64[ns]（仅用于搜索，绘图仍可用原始带时区时间）
+    def _to_np_dt64(series):
+        ts = pd.to_datetime(series)
+        # 若带时区，先转 UTC 再去 tz，保证是统一的 naive datetime64[ns]
+        if getattr(ts.dt, "tz", None) is not None:
+            ts = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+        return ts.values.astype("datetime64[ns]")
+
+    # 把单个时间也转成 datetime64[ns]
+    def _coerce_t(t):
+        tt = pd.to_datetime(t)
+        if getattr(getattr(tt, "tz", None), "zone", None) or getattr(tt, "tzinfo", None):
+            tt = tt.tz_convert("UTC").tz_localize(None)
+        return np.datetime64(tt.to_datetime64())  # datetime64[ns]
+
     for d, g in df.groupby("date", sort=False):
         g = g.sort_values("time").reset_index(drop=True)
-        times = pd.to_datetime(g["time"]).values
+
+        # 统一好的时间数组（用于 searchsorted）
+        times_np = _to_np_dt64(g["time"])
+
         bid = g["bidPrice"].astype(float).values
         ask = g["askPrice"].astype(float).values
         mid = g["mid"].astype(float).values
@@ -371,79 +387,76 @@ def backtest_hold60_cn(signals: pd.DataFrame,
         light = g["light_confirm"].astype(bool).values
         Twait = g["T_wait_sec"].astype(int).values
 
-        if len(g) == 0: 
+        if len(g) == 0:
             continue
 
         def _idx_at_or_after(t):
-            i = np.searchsorted(times, t, side="left")
-            return int(i) if i < len(times) else None
+            i = np.searchsorted(times_np, _coerce_t(t), side="left")
+            return int(i) if i < len(times_np) else None
 
         def _px(i, side):
             if i is None: return np.nan
             if fill == "mid": return mid[i]
             return ask[i] if side=="buy" else bid[i]
 
-        # 会话边界：避开午休/集合竞价；若落入禁做区域，则用当天最后一个允许交易的时刻
+        # 会话允许的最后索引（避开午休/集合竞价）
         allowed = ~(g["bucket"].isin(["auction_open","lunch_break","close_auction","off"]))
-        if allowed.any():
-            last_allowed_idx = int(np.where(allowed.values)[0][-1])
+        last_allowed_idx = int(np.where(allowed.values)[0][-1]) if allowed.any() else len(g)-1
+
+        # 第一腿：enter_only 或 enter_then_scale_if_confirm
+        if mode != "confirm_only":
+            enter_idx = np.flatnonzero(enter_flag==1)
+            for i0 in enter_idx:
+                t0 = g["time"].iloc[i0]  # 用原始 pandas 时间做加法
+                t_exit_1 = t0 + pd.Timedelta(seconds=hold_sec)
+                ix1 = _idx_at_or_after(t_exit_1)
+                if ix1 is None or ix1 > last_allowed_idx:
+                    ix1 = last_allowed_idx
+                p_in1 = _px(i0, "buy")
+                p_out1 = _px(ix1, "sell")
+                if not (np.isnan(p_in1) or np.isnan(p_out1)):
+                    w1 = 0.35 if mode=="enter_then_scale_if_confirm" else 1.0
+                    all_legs.append({
+                        "date": d,
+                        "entry_time": g["time"].iloc[i0],
+                        "exit_time": g["time"].iloc[ix1],
+                        "entry_idx": int(g.index[i0]),
+                        "exit_idx": int(g.index[ix1]),
+                        "leg": 1,
+                        "weight": w1,
+                        "ret": (p_out1 - p_in1) / p_in1
+                    })
+
+                # 第二腿：T_wait 内出现轻确认
+                if mode == "enter_then_scale_if_confirm":
+                    t_dead = t0 + pd.Timedelta(seconds=int(Twait[i0]))
+                    # 用 pandas 布尔索引找确认时间，再用 searchsorted 取出场
+                    mask = (g["time"] > t0) & (g["time"] <= t_dead) & (g["light_confirm"]==1)
+                    if mask.any():
+                        i_confirm = int(np.flatnonzero(mask.values)[0])
+                        t_exit_2 = g["time"].iloc[i_confirm] + pd.Timedelta(seconds=hold_sec)
+                        ix2 = _idx_at_or_after(t_exit_2)
+                        if ix2 is None or ix2 > last_allowed_idx:
+                            ix2 = last_allowed_idx
+                        p_in2 = _px(i_confirm, "buy")
+                        p_out2 = _px(ix2, "sell")
+                        if not (np.isnan(p_in2) or np.isnan(p_out2)):
+                            all_legs.append({
+                                "date": d,
+                                "entry_time": g["time"].iloc[i_confirm],
+                                "exit_time": g["time"].iloc[ix2],
+                                "entry_idx": int(g.index[i_confirm]),
+                                "exit_idx": int(g.index[ix2]),
+                                "leg": 2,
+                                "weight": 0.65,
+                                "ret": (p_out2 - p_in2) / p_in2
+                            })
+
+        # confirm_only 模式：仅确认建仓
         else:
-            last_allowed_idx = len(g)-1
-
-        # 根据模式决定第一腿是否必建
-        enter_idx = np.flatnonzero(enter_flag==1) if mode!="confirm_only" else np.array([], dtype=int)
-        confirm_candidates = np.flatnonzero(light==1) if mode=="confirm_only" else None
-
-        # 第一腿：只要 front_run_enter==1 就建（enter_only 或 enter_then_scale_if_confirm）
-        for i0 in enter_idx:
-            t0 = times[i0]
-            t_exit_1 = t0 + pd.Timedelta(seconds=hold_sec)
-            ix1 = _idx_at_or_after(t_exit_1)
-            if ix1 is None or ix1 > last_allowed_idx:
-                ix1 = last_allowed_idx
-            p_in1 = _px(i0, "buy")
-            p_out1 = _px(ix1, "sell")
-            if not (np.isnan(p_in1) or np.isnan(p_out1)):
-                w1 = 0.35 if mode=="enter_then_scale_if_confirm" else 1.0
-                all_legs.append({
-                    "date": d,
-                    "entry_time": times[i0],
-                    "exit_time": times[ix1],
-                    "entry_idx": int(g.index[i0]),
-                    "exit_idx": int(g.index[ix1]),
-                    "leg": 1,
-                    "weight": w1,
-                    "ret": (p_out1 - p_in1) / p_in1
-                })
-
-            # 第二腿：若 T_wait 内出现轻确认
-            if mode in ("enter_then_scale_if_confirm",):
-                t_dead = t0 + pd.Timedelta(seconds=int(Twait[i0]))
-                mask = (times > t0) & (times <= t_dead) & light
-                if mask.any():
-                    i_confirm = int(np.flatnonzero(mask)[0])
-                    t_exit_2 = times[i_confirm] + pd.Timedelta(seconds=hold_sec)
-                    ix2 = _idx_at_or_after(t_exit_2)
-                    if ix2 is None or ix2 > last_allowed_idx:
-                        ix2 = last_allowed_idx
-                    p_in2 = _px(i_confirm, "buy")
-                    p_out2 = _px(ix2, "sell")
-                    if not (np.isnan(p_in2) or np.isnan(p_out2)):
-                        all_legs.append({
-                            "date": d,
-                            "entry_time": times[i_confirm],
-                            "exit_time": times[ix2],
-                            "entry_idx": int(g.index[i_confirm]),
-                            "exit_idx": int(g.index[ix2]),
-                            "leg": 2,
-                            "weight": 0.65,
-                            "ret": (p_out2 - p_in2) / p_in2
-                        })
-
-        # confirm_only 模式：只有确认才建单
-        if mode == "confirm_only" and confirm_candidates is not None and len(confirm_candidates)>0:
-            for ic in confirm_candidates:
-                t_c = times[ic]
+            confirm_idx = np.flatnonzero(light==1)
+            for ic in confirm_idx:
+                t_c = g["time"].iloc[ic]
                 t_exit_c = t_c + pd.Timedelta(seconds=hold_sec)
                 ixc = _idx_at_or_after(t_exit_c)
                 if ixc is None or ixc > last_allowed_idx:
@@ -453,8 +466,8 @@ def backtest_hold60_cn(signals: pd.DataFrame,
                 if not (np.isnan(p_in) or np.isnan(p_out)):
                     all_legs.append({
                         "date": d,
-                        "entry_time": times[ic],
-                        "exit_time": times[ixc],
+                        "entry_time": g["time"].iloc[ic],
+                        "exit_time": g["time"].iloc[ixc],
                         "entry_idx": int(g.index[ic]),
                         "exit_idx": int(g.index[ixc]),
                         "leg": 1,
@@ -472,7 +485,7 @@ def backtest_hold60_cn(signals: pd.DataFrame,
     legs["ret_bp"] = legs["ret"]*1e4
     legs = legs.sort_values(["entry_time","exit_time"]).reset_index(drop=True)
 
-    # 将同一“事件”的多腿合并为一个 trade（按进入时间密集排序）
+    # 合并为 trade
     legs["trade_id"] = legs["entry_time"].rank(method="dense").astype(int)
     trades = legs.groupby("trade_id").apply(
         lambda g: pd.Series({
@@ -485,7 +498,6 @@ def backtest_hold60_cn(signals: pd.DataFrame,
     ).reset_index(drop=True)
     trades["ret_bp"] = trades["ret"]*1e4
 
-    # 统计
     summary = pd.Series({
         "n_legs": len(legs),
         "n_trades": len(trades),
@@ -494,7 +506,7 @@ def backtest_hold60_cn(signals: pd.DataFrame,
         "std_bp": trades["ret_bp"].std(ddof=0),
         "win_rate": (trades["ret"]>0).mean(),
         "cum_bp": trades["ret_bp"].sum(),
-        "sharpe": np.nan if trades["ret"].std(ddof=0)==0 else (trades["ret"].mean()/trades["ret"].std(ddof=0))*np.sqrt(252) # 粗略按日频率
+        "sharpe": np.nan if trades["ret"].std(ddof=0)==0 else (trades["ret"].mean()/trades["ret"].std(ddof=0))*np.sqrt(252)
     })
     return legs, trades, summary
 
