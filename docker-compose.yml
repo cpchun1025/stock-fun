@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  fetcher:
+    image: ashare-etl:latest
+    container_name: ashare-fetcher
+    environment:
+      - DB_URL=${DB_URL}
+      - TZ=${TZ:-Asia/Shanghai}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Optional overrides (or pass at run time):
+      # - SYMBOLS=${SYMBOLS}
+      # - PERIOD=${PERIOD:-1}
+      # - ADJUST=${ADJUST:-qfq}
+      # - DELAY_MIN=${DELAY_MIN:-10}
+      # - DELAY_MAX=${DELAY_MAX:-20}
+    working_dir: /app
+    command: ["python", "main.py", "--mode", "daily"]
+    restart: "no"   # run-and-exit; use scheduler to trigger daily at 18:00
+    # networks:
+    #   - default
+
+  # Optional backfill job (run manually when needed)
+  # backfill:
+  #   image: ashare-etl:latest
+  #   container_name: ashare-backfill
+  #   environment:
+  #     - DB_URL=${DB_URL}
+  #     - TZ=${TZ:-Asia/Shanghai}
+  #     - LOG_LEVEL=${LOG_LEVEL:-INFO}
+  #   working_dir: /app
+  #   command: ["python", "main.py", "--mode", "backfill", "--months", "${BACKFILL_MONTHS:-9}", "--delay-min", "${BACKFILL_DELAY_MIN:-5}", "--delay-max", "${BACKFILL_DELAY_MAX:-10}"]
+  #   restart: "no"

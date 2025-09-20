@@ -12,7 +12,7 @@ import re
 # Config
 # -------------------------
 base_dir = Path("data")
-date_str = "20250912"  # change or compute dynamically
+date_str = "20250920"  # change or compute dynamically
 data_dir = base_dir / date_str
 overwrite = False  # True to force regenerate even if outputs exist
 
